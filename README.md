@@ -1,69 +1,73 @@
-# intraday-ops-intelligence
+# ⚡ Intraday Ops Intelligence
 
-> Streaming Pub/Sub → Dataflow → BigQuery pipeline that answers "what's happening right now?" using Gemini Flash rolling summaries over intraday operational events.
+> A time-aware operational intelligence copilot that answers "what's happening right now?" using Gemini Flash rolling summaries over live GCP streaming events.
 
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
-[![GCP](https://img.shields.io/badge/GCP-Pub%2FSub%20%7C%20Dataflow%20%7C%20BigQuery-orange)](https://cloud.google.com/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-
----
-
-## Overview
-
-`intraday-ops-intelligence` is a real-time operational intelligence platform built entirely on native GCP streaming primitives. It ingests operational events (pipeline failures, SLA breaches, system alerts, job completions) via Pub/Sub, processes them through an Apache Beam streaming job on Dataflow, stores them in BigQuery partitioned/clustered tables, and periodically generates rolling summaries using Gemini Flash that can be queried in natural language.
-
-Key capabilities:
-- **True streaming ingestion**: Pub/Sub → Dataflow Flex Template → BigQuery streaming inserts with exactly-once semantics.
-- **Sliding-window summaries**: Cloud Scheduler triggers `summarizer/build_summary.py` every N minutes; Gemini Flash summarises the last rolling window of events with token-budget enforcement.
-- **Natural-language Q&A**: FastAPI `/ask` endpoint answers "what failed in the last hour?" or "are there SLA breaches today?" using summary+event context.
-- **Event simulator**: `simulator/event_simulator.py` publishes synthetic events for local development and load testing.
+[![Build](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/jthiruveedula/intraday-ops-intelligence/actions)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
+[![Streaming](https://img.shields.io/badge/ingest-Pub%2FSub%20%7C%20Dataflow-red)](https://cloud.google.com/dataflow)
+[![BigQuery](https://img.shields.io/badge/store-BigQuery%20Partitioned-4285F4)](https://cloud.google.com/bigquery)
+[![Freshness](https://img.shields.io/badge/retrieval-freshness--aware-orange)](https://github.com/jthiruveedula/intraday-ops-intelligence)
+[![Latency](https://img.shields.io/badge/p95%20answer-%3C3s-yellow)](https://github.com/jthiruveedula/intraday-ops-intelligence)
+[![Gemini](https://img.shields.io/badge/model-Gemini%202.0%20Flash-8E75FF)](https://cloud.google.com/vertex-ai)
+[![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
 ---
 
-## Architecture
+## ⚡ Why This Exists
+
+Operational events — pipeline failures, SLA breaches, job completions, system alerts — arrive continuously but humans can't keep up.  
+`intraday-ops-intelligence` ingests every event through a native GCP streaming stack, builds rolling Gemini summaries, and lets any team member ask **"what failed in the last hour?"** and get a grounded, timestamped answer in seconds.
+
+---
+
+## 🏗️ Architecture
 
 ```
 Operational Systems (pipelines, APIs, jobs)
        |
        v
-  Pub/Sub (events topic + dead-letter topic)
+  Pub/Sub  (events topic + dead-letter topic)
        |
        v
-  Dataflow Flex Template (streaming)
+  Dataflow Flex Template  (streaming)
   +------------------------------------------+
-  | ParseEvent -> Enrich -> BigQuerySink      |
+  |  ParseEvent -> Enrich -> BigQuerySink    |
   +------------------------------------------+
        |
        v
-  BigQuery (partitioned by event_date, clustered by event_type)
-  +-----------------------+    +-----------------------+
-  | events table          |    | summaries table        |
-  | (intraday events)     |    | (rolling summaries)    |
-  +-----------------------+    +-----------------------+
-            ^                           ^
-            |                           |
-            +---  Cloud Scheduler  ------+
-                  (triggers summarizer)
+  BigQuery  (partitioned by event_date, clustered by event_type)
+  +---------------------+   +----------------------+
+  |  events table       |   |  summaries table     |
+  |  (intraday events)  |   |  (rolling summaries) |
+  +---------------------+   +----------------------+
+            ^                          ^
+            |                          |
+            +---- Cloud Scheduler -----+
+                  (every 15 min)
                        |
                        v
                Gemini 2.0 Flash
                (window_query -> flash_summarize -> write)
                        |
                        v
-  Cloud Run - FastAPI /ask + /status
+  Cloud Run  -  FastAPI /ask + /status + /digest
 ```
 
 ---
 
-## Data Sources & Ingestion
+## 🕐 Freshness Model
 
-| Source | Mechanism | Frequency |
+| Layer | Mechanism | Freshness |
 |---|---|---|
-| Operational event publishers | Pub/Sub push subscription | Real-time |
-| Synthetic events (dev) | `simulator/event_simulator.py` | On-demand |
-| Rolling summaries | Cloud Scheduler -> `summarizer/build_summary.py` | Every 15 min |
+| Event ingestion | Pub/Sub → Dataflow streaming insert | Near real-time (<30s) |
+| Rolling summaries | Cloud Scheduler → `build_summary.py` | Every 15 min |
+| Q&A context | Last 4 summaries + time-filtered events | Last 1–24h (configurable) |
+| Staleness signal | `newest_source_ts` in every API response | Visible to caller |
 
-Event schema (JSON in Pub/Sub message):
+---
+
+## 📥 Event Schema
+
 ```json
 {
   "event_id": "uuid",
@@ -72,40 +76,42 @@ Event schema (JSON in Pub/Sub message):
   "severity": "critical | high | medium | low",
   "message": "Detailed event description",
   "metadata": {"job_id": "...", "dataset": "..."},
-  "timestamp": "2026-04-07T23:00:00Z"
+  "timestamp": "2026-04-08T00:00:00Z"
 }
 ```
 
 ---
 
-## RAG / Search Layer
+## 📁 Repo Structure
 
-- **Primary context**: Rolling summaries stored in `summaries` BigQuery table (last 4 summaries injected).
-- **Secondary context**: Direct event rows from `events` table via `window_query.py` (last N hours).
-- **Retrieval**: Full-text search (`LIKE`/`SEARCH`) on summaries + time-filtered event scan.
-- No vector index needed for this pattern — recency-based retrieval is more relevant than semantic similarity for operational events.
+```
+intraday-ops-intelligence/
+├── infra/                    # Terraform: Pub/Sub, Dataflow, BQ, Scheduler, IAM
+├── ingestion/                # Beam streaming pipeline
+│   ├── pipeline_main.py
+│   ├── transforms/
+│   └── flex_template/
+├── summarizer/               # Rolling summary generator
+│   ├── build_summary.py
+│   ├── window_query.py
+│   └── flash_summarizer.py
+├── api/                      # FastAPI /ask + /status + /digest
+│   ├── main.py
+│   └── staleness_middleware.py  # 🆕 Freshness telemetry per request
+├── jobs/                     # 🆕 Change digest background job
+│   └── build_change_digest.py
+├── observability/            # 🆕 Metrics: source age, latency, staleness
+│   └── metrics.py
+├── simulator/                # Synthetic event publisher
+│   └── event_simulator.py
+├── tests/
+└── docs/
+```
 
 ---
 
-## LLM Usage
+## 🚀 Quickstart
 
-| Parameter | Value |
-|---|---|
-| Model | `gemini-2.0-flash-001` |
-| Summary max input tokens | 8 000 (event batch) |
-| Summary max output tokens | 512 (concise summary) |
-| Q&A max input tokens | 4 000 (summaries + question) |
-| Q&A max output tokens | 1 024 |
-| Temperature (summary) | 0.1 (deterministic) |
-| Temperature (Q&A) | 0.3 |
-
-Token budget for summaries: `flash_summarizer.py` truncates the event batch to fit the window before the API call.
-
----
-
-## Deployment
-
-### Local Dev
 ```bash
 # Start event simulator + API
 docker-compose up
@@ -114,53 +120,64 @@ docker-compose up
 python simulator/event_simulator.py --scenario=anomaly_spike --count=100
 
 # Query the API
-curl -X POST http://localhost:8080/ask -d '{"question": "What failed in the last hour?"}'
-```
+curl -X POST http://localhost:8080/ask \
+  -H 'Content-Type: application/json' \
+  -d '{"question": "What failed in the last hour?"}'
 
-### GCP Deployment
-```bash
-# 1. Provision infra
+# GCP deploy
 cd infra && terraform apply -var-file=environments/dev.tfvars
-
-# 2. Build and submit Dataflow Flex Template
 gcloud dataflow flex-template build gs://my-bucket/templates/intraday.json \
-  --image-gcr-path=gcr.io/my-proj/intraday-pipeline:latest \
-  --sdk-language=PYTHON
-
-# 3. Deploy summarizer Cloud Run job
+  --image-gcr-path=gcr.io/my-proj/intraday-pipeline:latest --sdk-language=PYTHON
 gcloud run jobs deploy intraday-summarizer --source summarizer/
-
-# 4. Deploy API
 gcloud run deploy intraday-api --source api/ --region=us-central1
 ```
 
 ---
 
-## Repo Structure
+## 📊 LLM Usage
 
-```
-intraday-ops-intelligence/
-|-- infra/                    # Terraform: Pub/Sub, Dataflow, BQ, Scheduler, IAM
-|-- ingestion/                # Beam streaming pipeline
-|   |-- pipeline_main.py
-|   |-- transforms/
-|   `-- flex_template/
-|-- summarizer/               # Rolling summary generator
-|   |-- build_summary.py
-|   |-- window_query.py
-|   `-- flash_summarizer.py
-|-- api/                      # FastAPI /ask + /status
-|   `-- main.py
-|-- simulator/                # Synthetic event publisher for dev/testing
-|   `-- event_simulator.py
-|-- tests/
-`-- docs/
-```
+| Parameter | Value |
+|---|---|
+| Model | `gemini-2.0-flash-001` |
+| Summary input tokens | 8 000 max (event batch) |
+| Summary output tokens | 512 (concise) |
+| Q&A input tokens | 4 000 max |
+| Q&A output tokens | 1 024 |
+| Temperature (summary) | 0.1 |
+| Temperature (Q&A) | 0.3 |
 
 ---
 
-## Roadmap
+## 🔭 Observability
 
-1. **Anomaly detection layer** — statistical baseline per event type; Gemini Flash flags deviations in the summary.
-2. **PagerDuty / Slack webhook integration** — push critical summaries to on-call channels automatically.
-3. **Multi-project federation** — aggregate events from multiple GCP projects into a central BigQuery dataset for cross-org ops intelligence.
+- **Staleness telemetry**: every response includes `newest_source_ts`, `oldest_source_ts`, avg source age
+- **Request metrics**: latency, token spend, summary hit rate
+- **Change digest**: `jobs/build_change_digest.py` — topic-level delta summary per scheduled window
+
+---
+
+## 🛣️ Roadmap
+
+### Now / Next
+- [ ] **Freshness-Weighted Retrieval** — timestamp decay scoring in retrieval ranking
+- [ ] **Time-Window Query Params** — `?time_window=1h` filter on `/ask` endpoint
+- [ ] **Change Digest Job** — periodic delta summary stored in `summaries` table
+- [ ] **Staleness Telemetry** — `newest_source_ts` + avg source age in every response
+- [ ] **Alert Subscriptions** — topic-level digest push to Slack / PagerDuty
+
+### Future / Wow
+- [ ] **Live Decision Copilot** — multi-agent monitor → summarise → recommend next action
+- [ ] **Temporal Memory** — rewindable snapshots showing how answers evolved during the day
+- [ ] **Anomaly Narrator** — detect unusual event patterns and explain them in plain language
+- [ ] **Role-Based Watchlists** — personalised feeds for ops leads, data engineers, on-call
+- [ ] **Policy-Aware Action Triggers** — route critical events to tickets / alerts automatically
+
+---
+
+## 🤝 Contributing
+
+PRs welcome. Run `make lint test` before opening a PR.
+
+## 📄 License
+
+MIT — see [LICENSE](LICENSE)
